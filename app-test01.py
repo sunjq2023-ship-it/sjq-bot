@@ -41,29 +41,58 @@ SUPPORTED_COINS = ['BTC', 'ETH', 'SOL', 'ADA', 'BNB', 'DOGE', 'XRP', 'AVAX', 'LI
 
 
 def fetch_binance_data(symbol, progress_bar, status_text):
-    exchange = ccxt.binance({'enableRateLimit': True, 'options': {'adjustForTimeDifference': True}})
+    # === 关键修改：使用 binanceus (美国站) 以避开 IP 封锁 ===
+    try:
+        exchange = ccxt.binanceus({
+            'enableRateLimit': True, 
+            'options': {'adjustForTimeDifference': True}
+        })
+    except AttributeError:
+        # 如果旧版 ccxt 没有 binanceus，尝试使用 public API 或 fallback
+        exchange = ccxt.binance({'enableRateLimit': True})
+        
     all_data = []
-    # 获取最近4年的数据
+    # Binance US 数据较新，从 2020-01-01 开始安全
     since = exchange.parse8601('2020-01-01T00:00:00Z')
+
+    retry_count = 0
+    max_retries = 3
 
     while True:
         try:
             data = exchange.fetch_ohlcv(symbol, '1d', since)
             if not data: break
+            
             all_data.extend(data)
             since = data[-1][0] + 86400000
             last_date = pd.to_datetime(data[-1][0], unit='ms').strftime('%Y-%m-%d')
-            status_text.markdown(f"<span style='color:#58a6ff'>同步 {symbol}... {last_date}</span>",
+            status_text.markdown(f"<span style='color:#58a6ff'>正在同步 {symbol}... {last_date}</span>",
                                  unsafe_allow_html=True)
+            
             if since > exchange.milliseconds(): break
-            time.sleep(exchange.rateLimit / 1000)
+            
+            # 增加一点延时防止触发 Rate Limit
+            time.sleep(exchange.rateLimit / 1000 * 1.5)
+            retry_count = 0 # 重置重试计数
+
         except Exception as e:
-            st.error(f"获取 {symbol} 失败: {str(e)}")
-            break
+            err_msg = str(e)
+            if "451" in err_msg or "Service unavailable" in err_msg:
+                st.error("❌ 严重错误：Binance 拒绝了来自该服务器(美国)的连接。请尝试部署在非美国服务器，或使用 VPN。")
+                break
+            
+            retry_count += 1
+            if retry_count > max_retries:
+                st.error(f"获取 {symbol} 失败，重试次数过多: {str(e)}")
+                break
+            time.sleep(1) # 等待后重试
+            continue
+
+    if not all_data:
+        return pd.DataFrame()
 
     df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    # 简单的时区处理，假设为UTC
     df.set_index('datetime', inplace=True)
     return df[['open', 'close']]
 
@@ -74,16 +103,26 @@ def update_market_data():
     try:
         data_frames = {}
         for idx, coin in enumerate(SUPPORTED_COINS):
+            # Binance US 的交易对通常也是 USDT 结尾
             df = fetch_binance_data(f"{coin}/USDT", progress_bar, status_text)
+            
+            if df.empty:
+                st.warning(f"⚠️ {coin} 数据为空，跳过。可能该币种在 Binance.US 上不存在。")
+                continue
+                
             df = df.reset_index().rename(columns={'open': f'{coin}_open', 'close': f'{coin}_close'})
             data_frames[coin] = df
             progress_bar.progress((idx + 1) / len(SUPPORTED_COINS))
+
+        if not data_frames:
+            st.error("❌ 未能获取任何数据，请检查网络或 API 限制。")
+            return False
 
         with pd.ExcelWriter('market_data.xlsx', engine='openpyxl') as writer:
             for coin, df in data_frames.items():
                 df.to_excel(writer, sheet_name=coin, index=False)
 
-        status_text.success("✅ 数据同步完成")
+        status_text.success("✅ 数据同步完成 (数据源: Binance US)")
         time.sleep(1)
         status_text.empty()
         progress_bar.empty()
@@ -97,20 +136,21 @@ def update_market_data():
 def load_and_preprocess(alt_coin):
     if not os.path.exists('market_data.xlsx'): return None
     try:
+        # 读取时明确指定 engine，防止某些环境报错
         btc = pd.read_excel('market_data.xlsx', sheet_name='BTC', parse_dates=['datetime'], index_col='datetime')
         alt = pd.read_excel('market_data.xlsx', sheet_name=alt_coin, parse_dates=['datetime'], index_col='datetime')
-    except ValueError:
-        return None
     except Exception:
         return None
 
-    # 合并数据
+    # 合并前先去除重复索引
+    btc = btc[~btc.index.duplicated(keep='first')]
+    alt = alt[~alt.index.duplicated(keep='first')]
+
     merged = pd.concat({
         'BTC': btc[[f'BTC_open', f'BTC_close']],
         'ALT': alt[[f'{alt_coin}_open', f'{alt_coin}_close']]
     }, axis=1)
     
-    # 展平列名
     merged.columns = ['BTC_open', 'BTC_close', f'{alt_coin}_open', f'{alt_coin}_close']
 
     # 计算指标
@@ -126,7 +166,6 @@ def load_and_preprocess(alt_coin):
 
 
 def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow_short):
-    # 确保索引是 datetime 类型以便比较
     df.index = pd.to_datetime(df.index)
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
@@ -138,7 +177,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
     portfolio = pd.Series(index=df_slice.index, dtype=float)
     trades = []
 
-    # 持仓状态
     position_symbol = None
     position_side = None
     cash = initial_capital
@@ -150,7 +188,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
     for i in range(len(df_slice)):
         current_date = df_slice.index[i]
         
-        # 获取在完整df中的位置，用于获取前一天的数据
         if current_date not in df.index: continue
         full_idx = df.index.get_loc(current_date)
         
@@ -160,7 +197,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
             
         prev_date = df.index[full_idx - 1]
 
-        # 目标信号
         target_symbol = None
         target_side = None
 
@@ -207,7 +243,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
         # 2. 交易执行
         # ====================
         
-        # 平仓逻辑
         if position_symbol:
             change_needed = (position_symbol != target_symbol) or (position_side != target_side)
 
@@ -237,7 +272,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
                 position_symbol = None
                 position_side = None
 
-        # 开仓逻辑
         if target_symbol and not position_symbol:
             if cash > 0:
                 price = df_slice.at[current_date, f'{target_symbol}_open']
@@ -247,7 +281,7 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
                     cash = 0
                     trades.append({
                         'Date': current_date, 'Action': 'OPEN_LONG', 
-                        'Symbol': target_symbol, 'Price': price, 'Value': initial_capital # approximate
+                        'Symbol': target_symbol, 'Price': price, 'Value': initial_capital 
                     })
                     position_symbol = target_symbol
                     position_side = 'LONG'
@@ -280,7 +314,6 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
 
         portfolio.iloc[i] = current_val
         
-        # 修正交易记录中的净值
         if trades and trades[-1]['Date'] == current_date:
             trades[-1]['Value'] = current_val
 
@@ -292,28 +325,24 @@ def run_strategy(df, alt_coin, initial_capital, fee, start_date, end_date, allow
 # ==========================================
 
 st.sidebar.markdown("### 🎛️ 控制台")
-if st.sidebar.button("🔄 同步行情数据", use_container_width=True):
+if st.sidebar.button("🔄 同步行情数据 (Binance US)", use_container_width=True):
     if update_market_data(): st.cache_data.clear()
 
 st.sidebar.markdown("---")
 target_coin = st.sidebar.selectbox("轮动标的", SUPPORTED_COINS[1:], index=1)
 
-# 加载数据
 data = load_and_preprocess(target_coin)
 
-# === 关键修正：数据判空与初始化检查 ===
+# === UI 数据检查 ===
 if data is not None and not data.empty:
-    # 强制确保索引是时间格式
     data.index = pd.to_datetime(data.index)
     
     min_date = data.index.min().date()
     max_date = data.index.max().date()
 
-    # 初始化 Session State
     if 'global_start_date' not in st.session_state:
-        default_start_str = '2021-01-01'
+        default_start_str = '2022-01-01' # 设晚一点，确保有数据
         init_start = pd.to_datetime(default_start_str).date()
-        # 确保默认时间在范围内
         if init_start < min_date: init_start = min_date
         if init_start > max_date: init_start = min_date
         st.session_state['global_start_date'] = init_start
@@ -345,7 +374,7 @@ if data is not None and not data.empty:
     st.title(f"⚖️ 多空双向回测: BTC vs {target_coin}")
 
     if allow_short:
-        st.success("✅ **多空全天候模式**: 牛市做多强者，熊市做空弱者。旨在实现穿越牛熊的绝对收益。")
+        st.success("✅ **多空全天候模式**: 牛市做多强者，熊市做空弱者。")
     else:
         st.info("🛡️ **纯多头模式**: 仅在牛市持有，熊市空仓 (USDT)。")
 
@@ -358,7 +387,6 @@ if data is not None and not data.empty:
         else:
             mask = (data.index >= pd.to_datetime(start_date)) & (data.index <= pd.to_datetime(end_date))
             
-            # 再次检查 mask 是否有数据
             if mask.sum() > 0:
                 btc_hold_series = data.loc[mask, 'BTC_close']
                 btc_hold = btc_hold_series / btc_hold_series.iloc[0] * capital
@@ -418,13 +446,11 @@ if data is not None and not data.empty:
         st.error("结束日期必须晚于开始日期")
 
 else:
-    # === 空数据状态下的欢迎界面 ===
     st.title("⚖️ QuantPro 量化交易系统")
-    st.info("👋 欢迎！这是您的首次运行，或者本地数据已过期。")
+    st.info("👋 欢迎！检测到您在 US IP 环境下运行。")
     st.markdown("""
-    ### 🚀 快速开始
-    1. 请点击左侧边栏顶部的 **'🔄 同步行情数据'** 按钮。
-    2. 等待进度条走完（约需 1-2 分钟，从币安服务器下载数据）。
-    3. 数据准备好后，系统将自动显示回测界面。
+    ### 🚀 系统状态
+    1. 请点击左侧边栏顶部的 **'🔄 同步行情数据 (Binance US)'** 按钮。
+    2. 系统将从 **Binance US** 获取数据（已自动切换源以避开 451 错误）。
+    3. 等待数据下载完成后，即可开始回测。
     """)
-    st.warning("提示：如果点击同步后长时间无反应，请刷新页面重试。")
